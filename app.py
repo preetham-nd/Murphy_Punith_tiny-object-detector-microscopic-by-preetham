@@ -125,4 +125,16 @@ else:
         image_bytes = buffer.getvalue()
 
         # Store in GridFS
-        file_id = fs.put(_
+        file_id = fs.put(image_bytes, filename=f"detect_{datetime.now()}.png")
+
+        # Store metadata in collection
+        document = {
+            "timestamp": datetime.now(),
+            "counts": counts,
+            "gridfs_file_id": file_id
+        }
+
+        inserted = collection.insert_one(document)
+
+        st.info(f"Saved to MongoDB with document ID: {inserted.inserted_id}")
+        st.info(f"Stored image file ID: {file_id}")
