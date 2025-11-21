@@ -9,6 +9,19 @@ import requests
 import io
 import time
 
+from pymongo import MongoClient
+import base64
+from datetime import datetime
+
+# Load secret from Streamlit Cloud
+mongo_uri = st.secrets["mongo"]["uri"]
+
+# Connect to MongoDB
+client = MongoClient(mongo_uri)
+db = client["microscopy_db"]          # choose DB name
+collection = db["detections"]         # choose collection name
+
+
 st.set_page_config(layout="wide", page_title="Microscopy ONNX Demo")
 
 st.title("Microscopy Detector (ONNX via Ultralytics)")
