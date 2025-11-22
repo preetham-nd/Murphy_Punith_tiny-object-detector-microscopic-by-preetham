@@ -8,38 +8,37 @@ import requests
 from pymongo import MongoClient, errors
 import gridfs
 from datetime import datetime
-import hashlib, binascii, secrets
+import bcrypt
 
 st.set_page_config(layout="wide", page_title="Microscopy ONNX Demo")
 
-# ---------------------------
-# Configuration
-# ---------------------------
-MODEL_LOCAL_PATH = "best.onnx"
-GDRIVE_FILE_ID = ""       # optional
+# --------------------
+# Settings / Constants
+# --------------------
+MODEL_LOCAL_PATH = "best.onnx"   # change if model path is different (e.g., "models/best.onnx")
+GDRIVE_FILE_ID = ""              # optional, fill if you want the app to download the model from Drive
 MODEL_IMG_SIZE = 1024
 DEFAULT_CONF = 0.25
 
-# ---------------------------
-# Utilities: Mongo URI
-# ---------------------------
+# --------------------
+# Helpers: Mongo URI
+# --------------------
 def get_mongo_uri():
-    # prefer Streamlit secrets
+    # Try Streamlit secrets first, then environment variable MONGO_URI
     try:
-        mongo_conf = st.secrets.get("mongo") if st.secrets else None
+        mongo_conf = st.secrets.get("mongo")
         if mongo_conf and "uri" in mongo_conf:
             return mongo_conf["uri"]
     except Exception:
         pass
-    # fallback to environment variable
     return os.environ.get("MONGO_URI")
 
 MONGO_URI = get_mongo_uri()
 USE_DB = bool(MONGO_URI)
 
-# ---------------------------
-# Download model helper
-# ---------------------------
+# --------------------
+# Download helper (optional)
+# --------------------
 def download_from_gdrive(file_id, dest):
     if os.path.exists(dest):
         return dest
@@ -52,16 +51,16 @@ def download_from_gdrive(file_id, dest):
                 f.write(chunk)
     return dest
 
-# ---------------------------
-# Model loading (cached)
-# ---------------------------
+# --------------------
+# Load model (cached)
+# --------------------
 @st.cache_resource
 def load_model(model_path):
     return YOLO(model_path)
 
-# ---------------------------
-# Text size helper (robust)
-# ---------------------------
+# --------------------
+# Text measurement compatibility helper
+# --------------------
 def get_text_size(draw, text, font):
     try:
         bbox = draw.textbbox((0,0), text, font=font)
@@ -77,9 +76,9 @@ def get_text_size(draw, text, font):
             except Exception:
                 return (len(text)*6, 11)
 
-# ---------------------------
-# Draw preds
-# ---------------------------
+# --------------------
+# Drawing + postprocess
+# --------------------
 def draw_predictions(pil_img, results, conf_thresh=0.25, model_names=None):
     draw = ImageDraw.Draw(pil_img)
     try:
@@ -121,59 +120,55 @@ def draw_predictions(pil_img, results, conf_thresh=0.25, model_names=None):
             draw.text((x1, ty1), text, fill=(255,255,255), font=font)
     return pil_img, counts
 
-# ---------------------------
-# Password hashing helpers (PBKDF2-HMAC-SHA256)
-# ---------------------------
-def hash_password(password: str, salt: bytes = None):
-    if salt is None:
-        salt = secrets.token_bytes(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 150000)
-    return binascii.hexlify(dk).decode("ascii"), binascii.hexlify(salt).decode("ascii")
+# --------------------
+# Auth helpers (bcrypt)
+# --------------------
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-def verify_password(stored_hash_hex: str, stored_salt_hex: str, provided_password: str) -> bool:
-    salt = binascii.unhexlify(stored_salt_hex)
-    dk = hashlib.pbkdf2_hmac("sha256", provided_password.encode("utf-8"), salt, 150000)
-    return binascii.hexlify(dk).decode("ascii") == stored_hash_hex
+def check_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    except Exception:
+        return False
 
-# ---------------------------
-# MongoDB connection
-# ---------------------------
+# --------------------
+# Connect DB (if configured)
+# --------------------
 client = None
 db = None
 fs = None
 users_col = None
-collection = None
+detections_col = None
 db_error_msg = None
+
 if USE_DB:
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        client.server_info()  # trigger connection/auth check
+        client.server_info()  # test connection & auth
         db = client["microscopy_db"]
         fs = gridfs.GridFS(db)
-        collection = db["detections"]
         users_col = db["users"]
-        # ensure index on username
-        users_col.create_index("username", unique=True)
-    except errors.OperationFailure as e:
-        db_error_msg = ("MongoDB auth failure. Check username/password and user privileges.")
-    except errors.ServerSelectionTimeoutError as e:
+        detections_col = db["detections"]
+    except errors.OperationFailure:
+        db_error_msg = "MongoDB auth failure: check username/password and privileges."
+    except errors.ServerSelectionTimeoutError:
         db_error_msg = ("Could not connect to MongoDB Atlas. Possibly IP not whitelisted. "
-                        "Add 0.0.0.0/0 temporarily or add Streamlit Cloud IPs.")
+                        "Temporarily add 0.0.0.0/0 to Network Access for testing or ensure Streamlit Cloud IPs are allowed.")
     except Exception as e:
         db_error_msg = f"MongoDB connection error: {e}"
 
-# ---------------------------
-# Download model (optional)
-# ---------------------------
+# --------------------
+# Model download & load
+# --------------------
 if GDRIVE_FILE_ID:
     try:
+        st.info("Downloading model from Google Drive...")
         download_from_gdrive(GDRIVE_FILE_ID, MODEL_LOCAL_PATH)
+        st.success("Downloaded model.")
     except Exception as e:
         st.error(f"Downloading model failed: {e}")
 
-# ---------------------------
-# Load model
-# ---------------------------
 with st.spinner("Loading model..."):
     try:
         model = load_model(MODEL_LOCAL_PATH)
@@ -183,134 +178,130 @@ with st.spinner("Loading model..."):
         st.error(f"Failed to load model: {e}")
         st.stop()
 
-# ---------------------------
-# Authentication UI state
-# ---------------------------
-if "auth_mode" not in st.session_state:
-    st.session_state.auth_mode = None  # "signup" or "signin" or None
-
+# --------------------
+# Session state: user
+# --------------------
 if "user" not in st.session_state:
-    st.session_state.user = None  # username if logged in
+    st.session_state["user"] = None
+if "show_signin" not in st.session_state:
+    st.session_state["show_signin"] = False
+if "show_signup" not in st.session_state:
+    st.session_state["show_signup"] = False
 
-# Top row: big Sign Up / Sign In buttons
-c1, c2, c3 = st.columns([1,2,1])
-with c1:
-    if st.button("Sign up"):
-        st.session_state.auth_mode = "signup"
-with c2:
-    st.markdown("<h1 style='text-align:center;margin:0;padding:0;'>Microscopy Detector</h1>", unsafe_allow_html=True)
-with c3:
-    if st.button("Sign in"):
-        st.session_state.auth_mode = "signin"
-
-# If logged in, show username + logout
-if st.session_state.user:
-    st.sidebar.success(f"Signed in as: {st.session_state.user}")
-    if st.sidebar.button("Log out"):
-        st.session_state.user = None
-        st.session_state.auth_mode = None
-        st.experimental_rerun()
-
-# ---------------------------
-# Authentication forms
-# ---------------------------
-def show_signup_form():
-    st.subheader("Create an account")
-    with st.form("signup_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        password2 = st.text_input("Confirm password", type="password")
-        submitted = st.form_submit_button("Create account")
-        if submitted:
-            if not username or not password:
-                st.error("Provide username and password.")
-                return
-            if password != password2:
-                st.error("Passwords do not match.")
-                return
-            if not USE_DB:
-                st.error("DB not configured. Add Mongo URI to secrets or environment.")
-                return
-            if db_error_msg:
-                st.error(db_error_msg)
-                return
-            # check existing
-            if users_col.find_one({"username": username}):
-                st.error("Username already exists. Choose another.")
-                return
-            # hash and store
-            pw_hash, salt_hex = hash_password(password)
-            user_doc = {
-                "username": username,
-                "pw_hash": pw_hash,
-                "salt": salt_hex,
-                "created_at": datetime.utcnow()
-            }
-            try:
-                users_col.insert_one(user_doc)
-                st.success("Account created — you are now signed in.")
-                st.session_state.user = username
-                st.session_state.auth_mode = None
-            except Exception as e:
-                st.error(f"Failed to create account: {e}")
-
-def show_signin_form():
-    st.subheader("Sign in")
-    with st.form("signin_form"):
-        username = st.text_input("Username", key="signin_user")
-        password = st.text_input("Password", type="password", key="signin_pw")
-        submitted = st.form_submit_button("Sign in")
-        if submitted:
-            if not username or not password:
-                st.error("Provide username and password.")
-                return
-            if not USE_DB:
-                st.error("DB not configured. Add Mongo URI to secrets or environment.")
-                return
-            if db_error_msg:
-                st.error(db_error_msg)
-                return
-            # find user
-            user = users_col.find_one({"username": username})
-            if not user:
-                st.error("Invalid username or password.")
-                return
-            stored_hash = user.get("pw_hash")
-            stored_salt = user.get("salt")
-            if not stored_hash or not stored_salt:
-                st.error("User record invalid. Contact admin.")
-                return
-            ok = verify_password(stored_hash, stored_salt, password)
-            if not ok:
-                st.error("Invalid username or password.")
-                return
-            st.success("Signed in.")
-            st.session_state.user = username
-            st.session_state.auth_mode = None
-
-# Show auth form based on mode (but only if not already logged in)
-if not st.session_state.user:
-    if st.session_state.auth_mode == "signup":
-        show_signup_form()
-    elif st.session_state.auth_mode == "signin":
-        show_signin_form()
+# --------------------
+# Top UI: title + auth buttons
+# --------------------
+col_left, col_mid, col_right = st.columns([6, 1, 2])
+with col_left:
+    st.title("Microscopy Detector (ONNX via Ultralytics + MongoDB)")
+with col_right:
+    if st.session_state["user"]:
+        st.write(f"Signed in: **{st.session_state['user']['username']}**")
+        if st.button("Sign out"):
+            st.session_state["user"] = None
+            st.success("Signed out.")
     else:
-        st.write("")  # nothing
+        # Two buttons as requested
+        if st.button("Sign In"):
+            st.session_state["show_signin"] = True
+            st.session_state["show_signup"] = False
+        if st.button("Sign Up"):
+            st.session_state["show_signup"] = True
+            st.session_state["show_signin"] = False
 
-# ---------------------------
-# Detection panel - visible only when signed in
-# ---------------------------
-if not st.session_state.user:
-    st.info("Please Sign up or Sign in to use the detector and store results.")
-    st.stop()
+# --------------------
+# Show Sign In / Sign Up forms when requested
+# --------------------
+def create_user(username, email, password):
+    if not USE_DB:
+        return False, "DB not configured."
+    # Unique username or email check
+    if users_col.find_one({"$or": [{"username": username}, {"email": email}]}):
+        return False, "Username or email already exists."
+    hashed = hash_password(password)
+    doc = {
+        "username": username,
+        "email": email,
+        "password": hashed,
+        "created_at": datetime.utcnow()
+    }
+    users_col.insert_one(doc)
+    return True, None
 
-# Main detection UI (signed-in user)
-col1, col2 = st.columns([1, 1.2])
+def authenticate_user(user_key, password):
+    if not USE_DB:
+        return None, "DB not configured."
+    user = users_col.find_one({"$or": [{"username": user_key}, {"email": user_key}]})
+    if not user:
+        return None, "No such user."
+    if check_password(password, user["password"]):
+        # Do not return password to session
+        user_info = {"_id": str(user["_id"]), "username": user["username"], "email": user.get("email")}
+        return user_info, None
+    return None, "Incorrect password."
+
+# Sign up form
+if st.session_state["show_signup"]:
+    with st.form("signup_form"):
+        st.subheader("Create an account")
+        su_username = st.text_input("Username")
+        su_email = st.text_input("Email")
+        su_password = st.text_input("Password", type="password")
+        su_password2 = st.text_input("Confirm password", type="password")
+        submitted = st.form_submit_button("Sign Up")
+        if submitted:
+            if not su_username or not su_email or not su_password:
+                st.error("Please fill all fields.")
+            elif su_password != su_password2:
+                st.error("Passwords do not match.")
+            else:
+                if not USE_DB:
+                    st.error("MongoDB not configured. Cannot create user.")
+                elif db_error_msg:
+                    st.error(db_error_msg)
+                else:
+                    ok, msg = create_user(su_username, su_email, su_password)
+                    if ok:
+                        st.success("Account created. You are signed in.")
+                        st.session_state["user"] = {"username": su_username, "email": su_email}
+                        st.session_state["show_signup"] = False
+                    else:
+                        st.error(f"Signup failed: {msg}")
+
+# Sign in form
+if st.session_state["show_signin"]:
+    with st.form("signin_form"):
+        st.subheader("Sign in")
+        si_userkey = st.text_input("Username or Email")
+        si_password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign In")
+        if submitted:
+            if not si_userkey or not si_password:
+                st.error("Fill both fields.")
+            else:
+                if not USE_DB:
+                    st.error("MongoDB not configured. Cannot sign in.")
+                elif db_error_msg:
+                    st.error(db_error_msg)
+                else:
+                    user_info, msg = authenticate_user(si_userkey, si_password)
+                    if user_info:
+                        st.success("Signed in.")
+                        st.session_state["user"] = user_info
+                        st.session_state["show_signin"] = False
+                    else:
+                        st.error(f"Sign-in failed: {msg}")
+
+# --------------------
+# Main: Detection UI (left) and info (right)
+# --------------------
+col1, col2 = st.columns([1.2, 1])
+
 with col1:
     st.header("Run Detection")
     conf = st.slider("Confidence threshold", 0.0, 1.0, DEFAULT_CONF)
     uploaded = st.file_uploader("Upload microscope image", type=["png","jpg","jpeg","tif","tiff"])
-    camera = st.camera_input("Or take a picture (Chromium browsers)")
+    camera = st.camera_input("Or take a picture (Chromium-based browsers only)")
 
     if uploaded is None and camera is None:
         st.info("Upload an image or use the camera.")
@@ -332,52 +323,41 @@ with col1:
             st.write("Counts:", counts)
             st.success(f"Inference done in {time.time()-start:.2f}s")
 
-            # Save to DB (GridFS + document) if DB configured
+            # Save to DB only if user signed in
             if not USE_DB:
-                st.info("Mongo URI not provided. Skipping DB save.")
+                st.info("MongoDB not configured. Skipping DB save.")
+            elif db_error_msg:
+                st.error(db_error_msg)
+            elif not st.session_state["user"]:
+                st.warning("Sign in to save this detection to the DB.")
             else:
-                if db_error_msg:
-                    st.error(db_error_msg)
-                else:
-                    try:
-                        buf = io.BytesIO()
-                        pil_out.save(buf, format="PNG")
-                        img_bytes_out = buf.getvalue()
-                        file_id = fs.put(img_bytes_out, filename=f"det_{int(time.time())}.png", contentType="image/png")
-                        document = {
-                            "timestamp": datetime.utcnow(),
-                            "counts": counts,
-                            "model": MODEL_LOCAL_PATH,
-                            "img_gridfs_id": file_id,
-                            "user": st.session_state.user,
-                        }
-                        insertion_result = collection.insert_one(document)
-                        st.success(f"Saved detection to DB. doc_id: {insertion_result.inserted_id}")
-                    except Exception as e:
-                        st.error(f"Failed to save to DB: {e}")
+                try:
+                    # Save image to GridFS and document to detections collection
+                    buf = io.BytesIO()
+                    pil_out.save(buf, format="PNG")
+                    img_bytes_out = buf.getvalue()
+                    grid_id = fs.put(img_bytes_out, filename=f"det_{int(time.time())}.png", contentType="image/png")
+                    document = {
+                        "timestamp": datetime.utcnow(),
+                        "counts": counts,
+                        "model": MODEL_LOCAL_PATH,
+                        "img_gridfs_id": grid_id,
+                        "img_size": MODEL_IMG_SIZE,
+                        "user": st.session_state["user"]["username"]
+                    }
+                    res = detections_col.insert_one(document)
+                    st.success(f"Saved detection to DB. doc_id: {res.inserted_id}")
+                except Exception as e:
+                    st.error(f"Failed to save detection to DB: {e}")
 
 with col2:
-    st.header("History (your last 5 detections)")
-    if not USE_DB:
-        st.info("DB not configured. Set your Mongo URI to enable saved history.")
-    elif db_error_msg:
+    st.header("Info / Tips")
+    st.write("• Sign up or sign in using the buttons on top. You must be signed in to save detections.")
+    st.write("• If MongoDB is not configured, you can still run detection locally but saving is disabled.")
+    if db_error_msg:
         st.error(db_error_msg)
-    else:
-        try:
-            docs = list(collection.find({"user": st.session_state.user}).sort("timestamp", -1).limit(5))
-            if not docs:
-                st.info("No saved detections yet.")
-            else:
-                for doc in docs:
-                    st.write(f"Time: {doc.get('timestamp')}, Counts: {doc.get('counts')}")
-                    gfid = doc.get("img_gridfs_id")
-                    if gfid:
-                        try:
-                            grid_out = fs.get(gfid)
-                            data = grid_out.read()
-                            img = Image.open(io.BytesIO(data))
-                            st.image(img, width=300)
-                        except Exception as e:
-                            st.text(f"Could not read GridFS file {gfid}: {e}")
-        except Exception as e:
-            st.error(f"Failed to load history: {e}")
+    if USE_DB and not db_error_msg:
+        st.write("Connected to MongoDB.")
+        st.write(f"Database: microscopy_db    Users collection: users    Detections collection: detections")
+    st.write("")
+    st.write("Confidence threshold: set higher to reduce false positives. Typical starting value: 0.25 - 0.5.")
