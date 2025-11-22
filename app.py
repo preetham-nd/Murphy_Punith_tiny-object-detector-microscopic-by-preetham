@@ -10,21 +10,22 @@ import gridfs
 from datetime import datetime
 import bcrypt
 
-st.set_page_config(layout="wide", page_title="Microscopy ONNX Demo")
+# -----------------------
+# Config
+# -----------------------
+st.set_page_config(layout="wide", page_title="Microscopy ONNX Demo (Auth + Mongo)")
 
-# --------------------
-# Settings / Constants
-# --------------------
-MODEL_LOCAL_PATH = "best.onnx"   # change if model path is different (e.g., "models/best.onnx")
-GDRIVE_FILE_ID = ""              # optional, fill if you want the app to download the model from Drive
+# Model / DB settings - change if needed
+MODEL_LOCAL_PATH = "best.onnx"
+GDRIVE_FILE_ID = ""          # optional: set if you want app to download model from Drive
 MODEL_IMG_SIZE = 1024
 DEFAULT_CONF = 0.25
 
-# --------------------
-# Helpers: Mongo URI
-# --------------------
+# -----------------------
+# Helpers: Mongo URI, password hashing
+# -----------------------
 def get_mongo_uri():
-    # Try Streamlit secrets first, then environment variable MONGO_URI
+    # Prefer Streamlit secrets, fallback to env var
     try:
         mongo_conf = st.secrets.get("mongo")
         if mongo_conf and "uri" in mongo_conf:
@@ -36,9 +37,18 @@ def get_mongo_uri():
 MONGO_URI = get_mongo_uri()
 USE_DB = bool(MONGO_URI)
 
-# --------------------
-# Download helper (optional)
-# --------------------
+def hash_password(plain_password: str) -> bytes:
+    return bcrypt.hashpw(plain_password.encode("utf-8"), bcrypt.gensalt())
+
+def check_password(plain_password: str, hashed: bytes) -> bool:
+    try:
+        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed)
+    except Exception:
+        return False
+
+# -----------------------
+# Download model helper
+# -----------------------
 def download_from_gdrive(file_id, dest):
     if os.path.exists(dest):
         return dest
@@ -51,21 +61,20 @@ def download_from_gdrive(file_id, dest):
                 f.write(chunk)
     return dest
 
-# --------------------
+# -----------------------
 # Load model (cached)
-# --------------------
+# -----------------------
 @st.cache_resource
 def load_model(model_path):
     return YOLO(model_path)
 
-# --------------------
-# Text measurement compatibility helper
-# --------------------
+# -----------------------
+# Text size utility (robust across environments)
+# -----------------------
 def get_text_size(draw, text, font):
     try:
         bbox = draw.textbbox((0,0), text, font=font)
-        w = bbox[2] - bbox[0]
-        h = bbox[3] - bbox[1]
+        w = bbox[2] - bbox[0]; h = bbox[3] - bbox[1]
         return w, h
     except Exception:
         try:
@@ -76,9 +85,9 @@ def get_text_size(draw, text, font):
             except Exception:
                 return (len(text)*6, 11)
 
-# --------------------
-# Drawing + postprocess
-# --------------------
+# -----------------------
+# Draw detections
+# -----------------------
 def draw_predictions(pil_img, results, conf_thresh=0.25, model_names=None):
     draw = ImageDraw.Draw(pil_img)
     try:
@@ -120,54 +129,146 @@ def draw_predictions(pil_img, results, conf_thresh=0.25, model_names=None):
             draw.text((x1, ty1), text, fill=(255,255,255), font=font)
     return pil_img, counts
 
-# --------------------
-# Auth helpers (bcrypt)
-# --------------------
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-def check_password(password: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
-    except Exception:
-        return False
-
-# --------------------
-# Connect DB (if configured)
-# --------------------
+# -----------------------
+# MongoDB init
+# -----------------------
 client = None
 db = None
 fs = None
+collection = None
 users_col = None
-detections_col = None
 db_error_msg = None
-
 if USE_DB:
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        client.server_info()  # test connection & auth
+        client.server_info()  # triggers connection / auth
         db = client["microscopy_db"]
         fs = gridfs.GridFS(db)
+        collection = db["detections"]
         users_col = db["users"]
-        detections_col = db["detections"]
-    except errors.OperationFailure:
-        db_error_msg = "MongoDB auth failure: check username/password and privileges."
-    except errors.ServerSelectionTimeoutError:
-        db_error_msg = ("Could not connect to MongoDB Atlas. Possibly IP not whitelisted. "
-                        "Temporarily add 0.0.0.0/0 to Network Access for testing or ensure Streamlit Cloud IPs are allowed.")
+    except errors.OperationFailure as e:
+        db_error_msg = ("MongoDB auth failure. Check username/password and user privileges.")
+    except errors.ServerSelectionTimeoutError as e:
+        db_error_msg = ("Could not connect to MongoDB Atlas. Check Network Access / IP whitelist.")
     except Exception as e:
         db_error_msg = f"MongoDB connection error: {e}"
 
-# --------------------
-# Model download & load
-# --------------------
+# -----------------------
+# UI: Auth (Signin / Signup) at top
+# -----------------------
+st.markdown("<h1 style='text-align:left'>Microscopy Detector (ONNX via Ultralytics + MongoDB)</h1>", unsafe_allow_html=True)
+st.write("---")
+
+# Initialize session state
+if "user" not in st.session_state:
+    st.session_state.user = None  # will store {'username':..., '_id':...}
+
+col_auth_left, col_auth_right = st.columns([1,1])
+with col_auth_left:
+    st.subheader("Authentication")
+    # Show either logged in user or forms
+    if st.session_state.user:
+        st.success(f"Signed in as: {st.session_state.user.get('username')}")
+        if st.button("Logout"):
+            st.session_state.user = None
+            st.experimental_rerun()
+    else:
+        # Two buttons that open either sign-in or sign-up form
+        auth_choice = st.radio("Choose action", ("Sign In", "Sign Up"))
+
+        if auth_choice == "Sign Up":
+            with st.form("signup_form"):
+                su_username = st.text_input("Username", key="su_username")
+                su_email = st.text_input("Email", key="su_email")
+                su_password = st.text_input("Password", type="password", key="su_password")
+                su_password2 = st.text_input("Confirm password", type="password", key="su_password2")
+                submitted = st.form_submit_button("Create account")
+                if submitted:
+                    if not USE_DB:
+                        st.error("MongoDB URI not configured. Add to Streamlit secrets or env var.")
+                    else:
+                        if db_error_msg:
+                            st.error(db_error_msg)
+                        elif not su_username or not su_password:
+                            st.error("Provide a username and password.")
+                        elif su_password != su_password2:
+                            st.error("Passwords do not match.")
+                        else:
+                            # Check existing user
+                            existing = users_col.find_one({"$or": [{"username": su_username}, {"email": su_email}]})
+                            if existing:
+                                st.error("User with that username or email already exists.")
+                            else:
+                                hashed = hash_password(su_password)
+                                user_doc = {
+                                    "username": su_username,
+                                    "email": su_email,
+                                    "password": hashed,   # bytes
+                                    "created_at": datetime.utcnow()
+                                }
+                                try:
+                                    res = users_col.insert_one(user_doc)
+                                    st.success("Account created. You can now sign in.")
+                                except Exception as e:
+                                    st.error(f"Failed to create account: {e}")
+
+        else:  # Sign In
+            with st.form("signin_form"):
+                si_username = st.text_input("Username or Email", key="si_username")
+                si_password = st.text_input("Password", type="password", key="si_password")
+                submitted = st.form_submit_button("Sign in")
+                if submitted:
+                    if not USE_DB:
+                        st.error("MongoDB URI not configured. Add to Streamlit secrets or env var.")
+                    else:
+                        if db_error_msg:
+                            st.error(db_error_msg)
+                        else:
+                            # Find user by username or email
+                            user = users_col.find_one({"$or": [{"username": si_username}, {"email": si_username}]})
+                            if not user:
+                                st.error("User not found.")
+                            else:
+                                stored_pw = user.get("password")
+                                # stored_pw may be bytes or Binary in Mongo; handle both
+                                if isinstance(stored_pw, (bytes, bytearray)):
+                                    good = check_password(si_password, stored_pw)
+                                else:
+                                    # if it's a python dict or object, convert
+                                    try:
+                                        # bson.binary.Binary -> bytes
+                                        good = check_password(si_password, bytes(stored_pw))
+                                    except Exception:
+                                        good = False
+                                if good:
+                                    st.session_state.user = {"username": user.get("username"), "_id": user.get("_id")}
+                                    st.success(f"Signed in: {user.get('username')}")
+                                    st.experimental_rerun()
+                                else:
+                                    st.error("Incorrect password.")
+
+with col_auth_right:
+    st.subheader("Model & DB status")
+    model_status = "Loaded" if os.path.exists(MODEL_LOCAL_PATH) else "Not found locally"
+    st.write(f"Model file: `{MODEL_LOCAL_PATH}` — {model_status}")
+    if USE_DB:
+        if db_error_msg:
+            st.error(f"DB: Error - {db_error_msg}")
+        else:
+            st.success("DB: Connected")
+    else:
+        st.info("DB: Not configured. Add MONGO URI in Streamlit secrets or env var.")
+
+st.write("---")
+
+# -----------------------
+# Load model; allow auto-download if Drive ID present
+# -----------------------
 if GDRIVE_FILE_ID:
     try:
-        st.info("Downloading model from Google Drive...")
         download_from_gdrive(GDRIVE_FILE_ID, MODEL_LOCAL_PATH)
-        st.success("Downloaded model.")
     except Exception as e:
-        st.error(f"Downloading model failed: {e}")
+        st.error(f"Failed to download model from Drive: {e}")
 
 with st.spinner("Loading model..."):
     try:
@@ -178,130 +279,15 @@ with st.spinner("Loading model..."):
         st.error(f"Failed to load model: {e}")
         st.stop()
 
-# --------------------
-# Session state: user
-# --------------------
-if "user" not in st.session_state:
-    st.session_state["user"] = None
-if "show_signin" not in st.session_state:
-    st.session_state["show_signin"] = False
-if "show_signup" not in st.session_state:
-    st.session_state["show_signup"] = False
-
-# --------------------
-# Top UI: title + auth buttons
-# --------------------
-col_left, col_mid, col_right = st.columns([6, 1, 2])
-with col_left:
-    st.title("Microscopy Detector (ONNX via Ultralytics + MongoDB)")
-with col_right:
-    if st.session_state["user"]:
-        st.write(f"Signed in: **{st.session_state['user']['username']}**")
-        if st.button("Sign out"):
-            st.session_state["user"] = None
-            st.success("Signed out.")
-    else:
-        # Two buttons as requested
-        if st.button("Sign In"):
-            st.session_state["show_signin"] = True
-            st.session_state["show_signup"] = False
-        if st.button("Sign Up"):
-            st.session_state["show_signup"] = True
-            st.session_state["show_signin"] = False
-
-# --------------------
-# Show Sign In / Sign Up forms when requested
-# --------------------
-def create_user(username, email, password):
-    if not USE_DB:
-        return False, "DB not configured."
-    # Unique username or email check
-    if users_col.find_one({"$or": [{"username": username}, {"email": email}]}):
-        return False, "Username or email already exists."
-    hashed = hash_password(password)
-    doc = {
-        "username": username,
-        "email": email,
-        "password": hashed,
-        "created_at": datetime.utcnow()
-    }
-    users_col.insert_one(doc)
-    return True, None
-
-def authenticate_user(user_key, password):
-    if not USE_DB:
-        return None, "DB not configured."
-    user = users_col.find_one({"$or": [{"username": user_key}, {"email": user_key}]})
-    if not user:
-        return None, "No such user."
-    if check_password(password, user["password"]):
-        # Do not return password to session
-        user_info = {"_id": str(user["_id"]), "username": user["username"], "email": user.get("email")}
-        return user_info, None
-    return None, "Incorrect password."
-
-# Sign up form
-if st.session_state["show_signup"]:
-    with st.form("signup_form"):
-        st.subheader("Create an account")
-        su_username = st.text_input("Username")
-        su_email = st.text_input("Email")
-        su_password = st.text_input("Password", type="password")
-        su_password2 = st.text_input("Confirm password", type="password")
-        submitted = st.form_submit_button("Sign Up")
-        if submitted:
-            if not su_username or not su_email or not su_password:
-                st.error("Please fill all fields.")
-            elif su_password != su_password2:
-                st.error("Passwords do not match.")
-            else:
-                if not USE_DB:
-                    st.error("MongoDB not configured. Cannot create user.")
-                elif db_error_msg:
-                    st.error(db_error_msg)
-                else:
-                    ok, msg = create_user(su_username, su_email, su_password)
-                    if ok:
-                        st.success("Account created. You are signed in.")
-                        st.session_state["user"] = {"username": su_username, "email": su_email}
-                        st.session_state["show_signup"] = False
-                    else:
-                        st.error(f"Signup failed: {msg}")
-
-# Sign in form
-if st.session_state["show_signin"]:
-    with st.form("signin_form"):
-        st.subheader("Sign in")
-        si_userkey = st.text_input("Username or Email")
-        si_password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign In")
-        if submitted:
-            if not si_userkey or not si_password:
-                st.error("Fill both fields.")
-            else:
-                if not USE_DB:
-                    st.error("MongoDB not configured. Cannot sign in.")
-                elif db_error_msg:
-                    st.error(db_error_msg)
-                else:
-                    user_info, msg = authenticate_user(si_userkey, si_password)
-                    if user_info:
-                        st.success("Signed in.")
-                        st.session_state["user"] = user_info
-                        st.session_state["show_signin"] = False
-                    else:
-                        st.error(f"Sign-in failed: {msg}")
-
-# --------------------
-# Main: Detection UI (left) and info (right)
-# --------------------
-col1, col2 = st.columns([1.2, 1])
-
+# -----------------------
+# Main interface: detection
+# -----------------------
+col1, col2 = st.columns([1, 1.2])
 with col1:
     st.header("Run Detection")
     conf = st.slider("Confidence threshold", 0.0, 1.0, DEFAULT_CONF)
     uploaded = st.file_uploader("Upload microscope image", type=["png","jpg","jpeg","tif","tiff"])
-    camera = st.camera_input("Or take a picture (Chromium-based browsers only)")
+    camera = st.camera_input("Or take a picture (Chromium browsers)")
 
     if uploaded is None and camera is None:
         st.info("Upload an image or use the camera.")
@@ -323,41 +309,44 @@ with col1:
             st.write("Counts:", counts)
             st.success(f"Inference done in {time.time()-start:.2f}s")
 
-            # Save to DB only if user signed in
+            # Only save to DB if user signed in
             if not USE_DB:
-                st.info("MongoDB not configured. Skipping DB save.")
+                st.info("Mongo URI not provided. Skipping DB save.")
             elif db_error_msg:
                 st.error(db_error_msg)
-            elif not st.session_state["user"]:
-                st.warning("Sign in to save this detection to the DB.")
+            elif not st.session_state.user:
+                st.info("Sign in to save this detection to the DB.")
             else:
                 try:
-                    # Save image to GridFS and document to detections collection
+                    # Save image bytes to GridFS
                     buf = io.BytesIO()
                     pil_out.save(buf, format="PNG")
                     img_bytes_out = buf.getvalue()
-                    grid_id = fs.put(img_bytes_out, filename=f"det_{int(time.time())}.png", contentType="image/png")
+                    file_id = fs.put(img_bytes_out, filename=f"det_{int(time.time())}.png", contentType="image/png")
+
                     document = {
                         "timestamp": datetime.utcnow(),
                         "counts": counts,
                         "model": MODEL_LOCAL_PATH,
-                        "img_gridfs_id": grid_id,
-                        "img_size": MODEL_IMG_SIZE,
-                        "user": st.session_state["user"]["username"]
+                        "img_gridfs_id": file_id,
+                        "user": st.session_state.user.get("username")
                     }
-                    res = detections_col.insert_one(document)
-                    st.success(f"Saved detection to DB. doc_id: {res.inserted_id}")
+                    insertion_result = collection.insert_one(document)
+                    st.success(f"Saved detection to DB. doc_id: {insertion_result.inserted_id}")
                 except Exception as e:
-                    st.error(f"Failed to save detection to DB: {e}")
+                    st.error(f"Failed to save to DB: {e}")
 
 with col2:
-    st.header("Info / Tips")
-    st.write("• Sign up or sign in using the buttons on top. You must be signed in to save detections.")
-    st.write("• If MongoDB is not configured, you can still run detection locally but saving is disabled.")
-    if db_error_msg:
-        st.error(db_error_msg)
-    if USE_DB and not db_error_msg:
-        st.write("Connected to MongoDB.")
-        st.write(f"Database: microscopy_db    Users collection: users    Detections collection: detections")
-    st.write("")
-    st.write("Confidence threshold: set higher to reduce false positives. Typical starting value: 0.25 - 0.5.")
+    st.header("Instructions / Quick help")
+    st.markdown("""
+    - Use **Sign Up** to create an account (stored in MongoDB with a hashed password).  
+    - Use **Sign In** to sign in and enable saving detections.  
+    - If using Streamlit Cloud, add your MongoDB URI in *Manage app → Settings → Secrets* as:
+      ```
+      [mongo]
+      uri = "mongodb+srv://<username>:<password>@cluster0.dkc9xzx.mongodb.net/?retryWrites=true&w=majority"
+      ```
+    - Or set `MONGO_URI` as an environment variable.
+    """)
+
+# end of app.py
