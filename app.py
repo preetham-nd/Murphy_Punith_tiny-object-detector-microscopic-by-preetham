@@ -3,12 +3,12 @@ import streamlit as st
 from ultralytics import YOLO
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-import io, os, time, base64
 import requests
 from pymongo import MongoClient, errors
 import gridfs
-from datetime import datetime
 import bcrypt
+from datetime import datetime
+
 
 # -----------------------
 # Config
